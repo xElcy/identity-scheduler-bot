@@ -11,11 +11,14 @@ from dotenv import load_dotenv
 
 from .database import Database
 from .ui import (
+    AdminMonitorView,
     CandidateView,
     ScheduleView,
+    build_admin_monitor_embed,
     build_candidate_embed,
     build_personal_embed,
     build_result_embed,
+    refresh_admin_panel,
     schedule_page_count,
 )
 from .utils import parse_schedule_blocks, parse_schedule_dates
@@ -64,6 +67,8 @@ class ScheduleBot(commands.Bot):
                         self.add_view(ScheduleView(self.db, schedule["id"], profile["user_id"], page))
             for post in self.db.active_candidate_posts(guild.id):
                 self.add_view(CandidateView(self.db, post["schedule_id"]), message_id=post["message_id"])
+            if schedule["admin_panel_message_id"]:
+                self.add_view(AdminMonitorView(self.db, schedule["id"]), message_id=schedule["admin_panel_message_id"])
         logger.info("Logged in as %s", self.user)
 
     async def on_voice_state_update(
@@ -120,8 +125,17 @@ def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
     title="例：9月クラン戦の都合確認",
     dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
     blocks="時間帯をカンマ区切り。例：昼 12-18時, 夜 18-24時",
+    target_role="このロールを持つメンバーだけ個人鍵チャンネルを作成",
+    category="個人鍵チャンネルを入れるカテゴリー。省略時は.env設定を使用",
 )
-async def schedule_create(interaction: discord.Interaction, title: str, dates: str, blocks: str) -> None:
+async def schedule_create(
+    interaction: discord.Interaction,
+    title: str,
+    dates: str,
+    blocks: str,
+    target_role: discord.Role,
+    category: discord.CategoryChannel | None = None,
+) -> None:
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
@@ -136,11 +150,19 @@ async def schedule_create(interaction: discord.Interaction, title: str, dates: s
         await interaction.response.send_message(str(error), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    schedule_id = bot.db.create_schedule(guild.id, interaction.user.id, title, cells)
+    category_id = category.id if category else None
+    if category_id is None and PRIVATE_CATEGORY_ID and PRIVATE_CATEGORY_ID.isdigit():
+        category_id = int(PRIVATE_CATEGORY_ID)
+    schedule_id = bot.db.create_schedule(
+        guild.id,
+        interaction.user.id,
+        title,
+        cells,
+        target_role_id=target_role.id,
+        category_id=category_id,
+    )
 
-    members = [member for member in guild.members if not member.bot]
-    if not any(member.id == interaction.user.id for member in members):
-        members.append(interaction.user)
+    members = [member for member in guild.members if not member.bot and target_role in member.roles]
 
     created = 0
     failed = 0
@@ -183,6 +205,7 @@ async def schedule_edit(interaction: discord.Interaction, title: str, dates: str
     await _delete_candidate_messages(guild, schedule["id"])
     bot.db.edit_schedule(schedule["id"], title, cells)
     await _refresh_all_panels(guild, schedule["id"])
+    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
     await interaction.followup.send(
         "日程表を編集しました。安全のため、これまでの回答はリセットされています。",
         ephemeral=True,
@@ -267,6 +290,43 @@ async def schedule_candidates(interaction: discord.Interaction) -> None:
     await interaction.followup.send("このチャンネルに決定候補を表示しました。", ephemeral=True)
 
 
+@schedule_group.command(name="monitor", description="このチャンネルにリアルタイム集計パネルを設置します")
+async def schedule_monitor(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("運営用の通常テキストチャンネルで実行してください。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    message = None
+    if schedule["admin_panel_message_id"]:
+        panel_channel = guild.get_channel(schedule["admin_panel_channel_id"])
+        if isinstance(panel_channel, discord.TextChannel):
+            try:
+                message = await panel_channel.fetch_message(schedule["admin_panel_message_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                message = None
+    if message is None or message.channel.id != interaction.channel.id:
+        message = await interaction.channel.send(
+            embed=build_admin_monitor_embed(bot.db, schedule["id"], guild),
+            view=AdminMonitorView(bot.db, schedule["id"]),
+        )
+    else:
+        await message.edit(
+            embed=build_admin_monitor_embed(bot.db, schedule["id"], guild),
+            view=AdminMonitorView(bot.db, schedule["id"]),
+        )
+    bot.db.set_admin_panel(schedule["id"], interaction.channel.id, message.id)
+    await interaction.followup.send("リアルタイム集計パネルを設置しました。", ephemeral=True)
+
+
 @schedule_group.command(name="set-voice-role", description="VC入室通知を受け取るロールを設定します")
 @app_commands.describe(role="VC入室通知を受け取るロール")
 async def schedule_set_voice_role(interaction: discord.Interaction, role: discord.Role) -> None:
@@ -303,6 +363,11 @@ async def schedule_setup(interaction: discord.Interaction) -> None:
     if schedule is None:
         await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
         return
+    if schedule["target_role_id"]:
+        target_role = guild.get_role(schedule["target_role_id"])
+        if target_role is not None and (not isinstance(interaction.user, discord.Member) or target_role not in interaction.user.roles):
+            await interaction.response.send_message("この日程表の対象ロールが必要です。", ephemeral=True)
+            return
     await interaction.response.defer(ephemeral=True)
     channel = await _ensure_private_panel(guild, interaction.user, schedule["id"])
     await interaction.followup.send(f"専用チャンネルを用意しました：{channel.mention}", ephemeral=True)
@@ -335,6 +400,7 @@ async def schedule_close(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     bot.db.close_schedule(schedule["id"])
     await _refresh_all_panels(guild, schedule["id"])
+    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
     await interaction.followup.send("全員の日程回答を締め切りました。", ephemeral=True)
 
 
@@ -354,7 +420,13 @@ async def help_command(interaction: discord.Interaction) -> None:
 
 def _is_manager(interaction: discord.Interaction) -> bool:
     member = interaction.user
-    return isinstance(member, discord.Member) and member.guild_permissions.manage_guild
+    return isinstance(member, discord.Member) and (
+        member.guild_permissions.manage_guild or member.guild_permissions.administrator
+    )
+
+
+def _is_manager_member(member: discord.Member) -> bool:
+    return member.guild_permissions.manage_guild or member.guild_permissions.administrator
 
 
 def _channel_slug(member: discord.Member) -> str:
@@ -403,6 +475,14 @@ async def _delete_active_schedule(guild: discord.Guild) -> tuple[int, int]:
         return 0, 0
 
     await _delete_candidate_messages(guild, schedule["id"])
+    if schedule["admin_panel_channel_id"] and schedule["admin_panel_message_id"]:
+        panel_channel = guild.get_channel(schedule["admin_panel_channel_id"])
+        if isinstance(panel_channel, discord.TextChannel):
+            try:
+                panel_message = await panel_channel.fetch_message(schedule["admin_panel_message_id"])
+                await panel_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                logger.warning("Could not delete admin monitor panel %s", schedule["admin_panel_message_id"])
     deleted = 0
     failed = 0
     for profile in bot.db.private_profiles(guild.id):
@@ -426,6 +506,9 @@ async def _delete_active_schedule(guild: discord.Guild) -> tuple[int, int]:
 
 
 async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, schedule_id: int) -> discord.TextChannel:
+    schedule = bot.db.get_schedule(schedule_id)
+    if schedule is None:
+        raise RuntimeError("Schedule is not available")
     profile = bot.db.private_profile(guild.id, member.id)
     channel = None
     if profile and profile["channel_id"]:
@@ -440,6 +523,9 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
         bot_member = guild.me
         if bot_member is None:
             raise RuntimeError("Bot member is not available")
+        manager_overwrite = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
@@ -447,17 +533,37 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
                 view_channel=True, send_messages=True, read_message_history=True, manage_messages=True
             ),
         }
+        for manager in guild.members:
+            if not manager.bot and manager.id != member.id and _is_manager_member(manager):
+                overwrites[manager] = manager_overwrite
         category = None
-        if PRIVATE_CATEGORY_ID and PRIVATE_CATEGORY_ID.isdigit():
-            possible_category = guild.get_channel(int(PRIVATE_CATEGORY_ID))
+        category_id = schedule.get("category_id")
+        if category_id is None and PRIVATE_CATEGORY_ID and PRIVATE_CATEGORY_ID.isdigit():
+            category_id = int(PRIVATE_CATEGORY_ID)
+        if category_id:
+            possible_category = guild.get_channel(category_id)
             if isinstance(possible_category, discord.CategoryChannel):
                 category = possible_category
         channel = await guild.create_text_channel(
             name=f"🔒・予定-{_channel_slug(member)}",
             category=category,
             overwrites=overwrites,
-            topic="このチャンネルは本人とBOTだけが見られる個人用日程表です。",
+            topic="このチャンネルは対象本人・運営・BOTだけが見られる個人用日程表です。",
         )
+    else:
+        category_id = schedule.get("category_id")
+        if category_id is None and PRIVATE_CATEGORY_ID and PRIVATE_CATEGORY_ID.isdigit():
+            category_id = int(PRIVATE_CATEGORY_ID)
+        if category_id:
+            possible_category = guild.get_channel(category_id)
+            if isinstance(possible_category, discord.CategoryChannel) and channel.category_id != possible_category.id:
+                await channel.edit(category=possible_category, reason="日程表カテゴリーを更新")
+        manager_overwrite = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
+        for manager in guild.members:
+            if not manager.bot and manager.id != member.id and _is_manager_member(manager):
+                await channel.set_permissions(manager, overwrite=manager_overwrite)
 
     message = None
     if profile and profile["panel_message_id"]:

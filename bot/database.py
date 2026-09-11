@@ -80,6 +80,10 @@ class Database:
                     guild_id INTEGER NOT NULL,
                     organizer_id INTEGER NOT NULL,
                     title TEXT NOT NULL,
+                    target_role_id INTEGER,
+                    category_id INTEGER,
+                    admin_panel_channel_id INTEGER,
+                    admin_panel_message_id INTEGER,
                     is_open INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL DEFAULT (unixepoch())
                 );
@@ -131,6 +135,17 @@ class Database:
             except sqlite3.OperationalError as error:
                 if "duplicate column name" not in str(error).lower():
                     raise
+            for column, definition in (
+                ("target_role_id", "INTEGER"),
+                ("category_id", "INTEGER"),
+                ("admin_panel_channel_id", "INTEGER"),
+                ("admin_panel_message_id", "INTEGER"),
+            ):
+                try:
+                    connection.execute(f"ALTER TABLE schedules ADD COLUMN {column} {definition}")
+                except sqlite3.OperationalError as error:
+                    if "duplicate column name" not in str(error).lower():
+                        raise
 
     def create_event(self, guild_id: int, channel_id: int, organizer_id: int, title: str, start_at: float, remind_minutes: int) -> int:
         with self._connect() as connection:
@@ -307,12 +322,24 @@ class Database:
         with self._connect() as connection:
             connection.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
 
-    def create_schedule(self, guild_id: int, organizer_id: int, title: str, cells: list[dict[str, Any]]) -> int:
+    def create_schedule(
+        self,
+        guild_id: int,
+        organizer_id: int,
+        title: str,
+        cells: list[dict[str, Any]],
+        target_role_id: int | None = None,
+        category_id: int | None = None,
+    ) -> int:
         with self._connect() as connection:
             connection.execute("UPDATE schedules SET is_open = 0 WHERE guild_id = ? AND is_open = 1", (guild_id,))
             cursor = connection.execute(
-                "INSERT INTO schedules (guild_id, organizer_id, title) VALUES (?, ?, ?)",
-                (guild_id, organizer_id, title),
+                """
+                INSERT INTO schedules
+                (guild_id, organizer_id, title, target_role_id, category_id)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (guild_id, organizer_id, title, target_role_id, category_id),
             )
             schedule_id = int(cursor.lastrowid)
             connection.executemany(
@@ -395,6 +422,18 @@ class Database:
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
 
+    def schedule_answered_users(self, schedule_id: int) -> list[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT user_id FROM schedule_answers
+                WHERE schedule_id = ? AND status != 'blank'
+                ORDER BY user_id
+                """,
+                (schedule_id,),
+            ).fetchall()
+            return [int(row["user_id"]) for row in rows]
+
     def private_profile(self, guild_id: int, user_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -424,6 +463,24 @@ class Database:
     def close_schedule(self, schedule_id: int) -> None:
         with self._connect() as connection:
             connection.execute("UPDATE schedules SET is_open = 0 WHERE id = ?", (schedule_id,))
+
+    def set_admin_panel(self, schedule_id: int, channel_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE schedules
+                SET admin_panel_channel_id = ?, admin_panel_message_id = ?
+                WHERE id = ?
+                """,
+                (channel_id, message_id, schedule_id),
+            )
+
+    def clear_admin_panel(self, schedule_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE schedules SET admin_panel_channel_id = NULL, admin_panel_message_id = NULL WHERE id = ?",
+                (schedule_id,),
+            )
 
     def delete_schedule(self, schedule_id: int) -> None:
         with self._connect() as connection:

@@ -158,6 +158,93 @@ def build_announcement_embed(db: Database, schedule_id: int, cell_id: int, guild
     return embed
 
 
+def build_admin_monitor_embed(db: Database, schedule_id: int, guild: discord.Guild) -> discord.Embed:
+    schedule = db.get_schedule(schedule_id)
+    if schedule is None:
+        return discord.Embed(title="予定表が見つかりません", color=discord.Color.red())
+
+    target_role = guild.get_role(schedule["target_role_id"]) if schedule["target_role_id"] else None
+    eligible_members = [
+        member
+        for member in guild.members
+        if not member.bot and (target_role is None or target_role in member.roles)
+    ]
+    answered = set(db.schedule_answered_users(schedule_id))
+    target_label = f"@{target_role.name}" if target_role else "対象ロール未設定"
+    status_label = "回答受付中" if schedule["is_open"] else "回答締切"
+    embed = discord.Embed(
+        title=f"📊 リアルタイム集計｜{schedule['title']}",
+        description=(
+            f"対象：**{target_label}**　|　{status_label}\n"
+            f"回答済み：**{len(answered & {member.id for member in eligible_members})}/{len(eligible_members)}人**\n"
+            "個人の回答が変更されるたびに、このパネルも更新されます。"
+        ),
+        color=discord.Color.blurple() if schedule["is_open"] else discord.Color.greyple(),
+    )
+    groups = _group_cells(db.schedule_cells(schedule_id))
+    total = len(eligible_members)
+    for _date_key, date_cells in groups.items():
+        lines = []
+        for cell in date_cells:
+            counts = db.schedule_answer_counts(schedule_id, cell["id"])
+            answered_count = counts["available"] + counts["maybe"] + counts["unavailable"]
+            unanswered = max(0, total - answered_count)
+            lines.append(
+                f"`{cell['block_label']}`　✅ {counts['available']}　△ {counts['maybe']}　"
+                f"❌ {counts['unavailable']}　— {unanswered}"
+            )
+        embed.add_field(name=f"📅 {date_cells[0]['date_label']}", value="\n".join(lines), inline=False)
+    embed.set_footer(text="✅ 行ける　△ 未定　❌ 行けない　— 未回答")
+    return embed
+
+
+async def refresh_admin_panel(client: discord.Client, db: Database, schedule_id: int, guild: discord.Guild) -> None:
+    schedule = db.get_schedule(schedule_id)
+    if schedule is None or not schedule["admin_panel_channel_id"] or not schedule["admin_panel_message_id"]:
+        return
+    channel = guild.get_channel(schedule["admin_panel_channel_id"])
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(schedule["admin_panel_channel_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        message = await channel.fetch_message(schedule["admin_panel_message_id"])
+        await message.edit(
+            embed=build_admin_monitor_embed(db, schedule_id, guild),
+            view=AdminMonitorView(db, schedule_id),
+        )
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+
+class AdminMonitorView(discord.ui.View):
+    def __init__(self, db: Database, schedule_id: int) -> None:
+        super().__init__(timeout=None)
+        self.db = db
+        self.schedule_id = schedule_id
+
+    @discord.ui.button(
+        label="集計を更新",
+        emoji="🔄",
+        style=discord.ButtonStyle.secondary,
+        custom_id="schedule:admin-monitor:refresh",
+    )
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.manage_guild:
+            await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=build_admin_monitor_embed(self.db, self.schedule_id, interaction.guild),
+            view=AdminMonitorView(self.db, self.schedule_id),
+        )
+
+
 class CandidateView(discord.ui.View):
     def __init__(self, db: Database, schedule_id: int) -> None:
         super().__init__(timeout=None)
@@ -266,6 +353,8 @@ class ScheduleView(discord.ui.View):
                 embed=build_personal_embed(self.db, self.schedule_id, self.user_id, self.page),
                 view=ScheduleView(self.db, self.schedule_id, self.user_id, self.page),
             )
+            if interaction.guild is not None:
+                await refresh_admin_panel(interaction.client, self.db, self.schedule_id, interaction.guild)
 
         return callback
 
