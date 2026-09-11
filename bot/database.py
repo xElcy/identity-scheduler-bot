@@ -110,6 +110,19 @@ class Database:
                     panel_message_id INTEGER,
                     PRIMARY KEY (guild_id, user_id)
                 );
+                CREATE TABLE IF NOT EXISTS guild_settings (
+                    guild_id INTEGER PRIMARY KEY,
+                    announcement_channel_id INTEGER,
+                    voice_notify_role_id INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS candidate_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    schedule_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    created_at REAL NOT NULL DEFAULT (unixepoch()),
+                    FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
+                );
                 """
             )
 
@@ -409,3 +422,95 @@ class Database:
     def delete_schedule(self, schedule_id: int) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+
+    def edit_schedule(self, schedule_id: int, title: str, cells: list[dict[str, Any]]) -> None:
+        """Replace the active schedule's cells and reset answers.
+
+        Keeping the schedule id means existing private channels can be reused.
+        Answers are intentionally reset because edited cells may represent
+        different dates or time blocks.
+        """
+        with self._connect() as connection:
+            connection.execute("UPDATE schedules SET title = ?, is_open = 1 WHERE id = ?", (title, schedule_id))
+            connection.execute("DELETE FROM schedule_answers WHERE schedule_id = ?", (schedule_id,))
+            connection.execute("DELETE FROM candidate_posts WHERE schedule_id = ?", (schedule_id,))
+            connection.execute("DELETE FROM schedule_cells WHERE schedule_id = ?", (schedule_id,))
+            connection.executemany(
+                """
+                INSERT INTO schedule_cells
+                (schedule_id, date_key, date_label, block_key, block_label, cell_order)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (schedule_id, cell["date_key"], cell["date_label"], cell["block_key"], cell["block_label"], index)
+                    for index, cell in enumerate(cells)
+                ],
+            )
+
+    def clear_private_profiles(self, guild_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM private_profiles WHERE guild_id = ?", (guild_id,))
+
+    def set_announcement_channel(self, guild_id: int, channel_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO guild_settings (guild_id, announcement_channel_id)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET announcement_channel_id = excluded.announcement_channel_id
+                """,
+                (guild_id, channel_id),
+            )
+
+    def announcement_channel_id(self, guild_id: int) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT announcement_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+            return int(row["announcement_channel_id"]) if row and row["announcement_channel_id"] else None
+
+    def set_voice_notify_role(self, guild_id: int, role_id: int | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO guild_settings (guild_id, voice_notify_role_id)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET voice_notify_role_id = excluded.voice_notify_role_id
+                """,
+                (guild_id, role_id),
+            )
+
+    def voice_notify_role_id(self, guild_id: int) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT voice_notify_role_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+            return int(row["voice_notify_role_id"]) if row and row["voice_notify_role_id"] else None
+
+    def create_candidate_post(self, schedule_id: int, channel_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO candidate_posts (schedule_id, channel_id, message_id) VALUES (?, ?, ?)",
+                (schedule_id, channel_id, message_id),
+            )
+
+    def candidate_posts(self, schedule_id: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM candidate_posts WHERE schedule_id = ? ORDER BY id", (schedule_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def active_candidate_posts(self, guild_id: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT cp.*, s.guild_id
+                FROM candidate_posts cp
+                JOIN schedules s ON s.id = cp.schedule_id
+                WHERE s.guild_id = ? AND s.is_open = 1
+                ORDER BY cp.id
+                """,
+                (guild_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]

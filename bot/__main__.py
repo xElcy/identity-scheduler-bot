@@ -10,7 +10,14 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from .database import Database
-from .ui import ScheduleView, build_personal_embed, build_result_embed, schedule_page_count
+from .ui import (
+    CandidateView,
+    ScheduleView,
+    build_candidate_embed,
+    build_personal_embed,
+    build_result_embed,
+    schedule_page_count,
+)
 from .utils import parse_schedule_blocks, parse_schedule_dates
 
 load_dotenv()
@@ -55,11 +62,55 @@ class ScheduleBot(commands.Bot):
                 if profile["channel_id"]:
                     for page in range(schedule_page_count(self.db, schedule["id"])):
                         self.add_view(ScheduleView(self.db, schedule["id"], profile["user_id"], page))
+            for post in self.db.active_candidate_posts(guild.id):
+                self.add_view(CandidateView(self.db, post["schedule_id"]), message_id=post["message_id"])
         logger.info("Logged in as %s", self.user)
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if member.bot or after.channel is None:
+            return
+        if before.channel is not None and before.channel.id == after.channel.id:
+            return
+
+        role_id = self.db.voice_notify_role_id(member.guild.id)
+        channel_id = self.db.announcement_channel_id(member.guild.id)
+        if role_id is None or channel_id is None:
+            return
+        role = member.guild.get_role(role_id)
+        channel = member.guild.get_channel(channel_id)
+        if role is None or not isinstance(channel, discord.TextChannel):
+            return
+
+        await channel.send(
+            f"🔊 {member.display_name} さんが **{after.channel.name}** に入りました。 {role.mention}",
+            allowed_mentions=discord.AllowedMentions(roles=True),
+        )
 
 
 bot = ScheduleBot()
 schedule_group = app_commands.Group(name="schedule", description="個人専用チャンネルで日程を調整します")
+
+
+def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
+    parsed_dates = parse_schedule_dates(dates, TIMEZONE)
+    parsed_blocks = parse_schedule_blocks(blocks)
+    if len(parsed_dates) > 21:
+        raise ValueError("日付は最大21日までにしてください。")
+    return [
+        {
+            "date_key": date_key,
+            "date_label": date_label,
+            "block_key": block_key,
+            "block_label": block_label,
+        }
+        for date_key, date_label in parsed_dates
+        for block_key, block_label in parsed_blocks
+    ]
 
 
 @schedule_group.command(name="create", description="新しい個人用日程表を作成します")
@@ -78,26 +129,10 @@ async def schedule_create(interaction: discord.Interaction, title: str, dates: s
         return
 
     try:
-        parsed_dates = parse_schedule_dates(dates, TIMEZONE)
-        parsed_blocks = parse_schedule_blocks(blocks)
+        cells = _build_schedule_cells(dates, blocks)
     except ValueError as error:
         await interaction.response.send_message(str(error), ephemeral=True)
         return
-
-    if len(parsed_dates) > 21:
-        await interaction.response.send_message("日付は最大21日までにしてください。", ephemeral=True)
-        return
-
-    cells = [
-        {
-            "date_key": date_key,
-            "date_label": date_label,
-            "block_key": block_key,
-            "block_label": block_label,
-        }
-        for date_key, date_label in parsed_dates
-        for block_key, block_label in parsed_blocks
-    ]
     await interaction.response.defer(ephemeral=True)
     schedule_id = bot.db.create_schedule(guild.id, interaction.user.id, title, cells)
 
@@ -119,6 +154,115 @@ async def schedule_create(interaction: discord.Interaction, title: str, dates: s
     if failed:
         result += f" {failed}人分は権限不足などで作成できませんでした。"
     await interaction.followup.send(result, ephemeral=True)
+
+
+@schedule_group.command(name="edit", description="受付中の日程表を編集します")
+@app_commands.describe(
+    title="例：9月クラン戦の都合確認",
+    dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
+    blocks="時間帯をカンマ区切り。例：昼 12-18時, 夜 18-24時",
+)
+async def schedule_edit(interaction: discord.Interaction, title: str, dates: str, blocks: str) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
+        return
+    try:
+        cells = _build_schedule_cells(dates, blocks)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await _delete_candidate_messages(guild, schedule["id"])
+    bot.db.edit_schedule(schedule["id"], title, cells)
+    await _refresh_all_panels(guild, schedule["id"])
+    await interaction.followup.send(
+        "日程表を編集しました。安全のため、これまでの回答はリセットされています。",
+        ephemeral=True,
+    )
+
+
+@schedule_group.command(name="delete", description="受付中の日程表と個人チャンネルを削除します")
+async def schedule_delete(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if bot.db.active_schedule(interaction.guild.id) is None:
+        await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        "現在の予定表と、登録されている個人用鍵チャンネルをすべて削除します。\n本当に実行しますか？",
+        ephemeral=True,
+        view=DeleteScheduleView(),
+    )
+
+
+@schedule_group.command(name="set-announcement", description="このチャンネルを確定日程の告知先にします")
+async def schedule_set_announcement(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("通常のテキストチャンネルで実行してください。", ephemeral=True)
+        return
+    bot.db.set_announcement_channel(interaction.guild.id, interaction.channel.id)
+    await interaction.response.send_message(
+        f"確定日程の告知先を {interaction.channel.mention} に設定しました。", ephemeral=True
+    )
+
+
+@schedule_group.command(name="candidates", description="回答から決定候補を管理者チャンネルに表示します")
+async def schedule_candidates(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("管理者用の通常テキストチャンネルで実行してください。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    message = await interaction.channel.send(
+        embed=build_candidate_embed(bot.db, schedule["id"]),
+        view=CandidateView(bot.db, schedule["id"]),
+    )
+    bot.db.create_candidate_post(schedule["id"], interaction.channel.id, message.id)
+    await interaction.followup.send("このチャンネルに決定候補を表示しました。", ephemeral=True)
+
+
+@schedule_group.command(name="set-voice-role", description="VC入室通知を受け取るロールを設定します")
+@app_commands.describe(role="VC入室通知を受け取るロール")
+async def schedule_set_voice_role(interaction: discord.Interaction, role: discord.Role) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if role.is_default():
+        await interaction.response.send_message("@everyone は通知ロールに設定できません。", ephemeral=True)
+        return
+    bot.db.set_voice_notify_role(interaction.guild.id, role.id)
+    await interaction.response.send_message(
+        f"VC入室通知の対象を {role.mention} に設定しました。\n"
+        "確定日程の告知先チャンネルで、そのロールが見られる権限も確認してください。",
+        ephemeral=True,
+    )
+
+
+@schedule_group.command(name="clear-voice-role", description="VC入室通知ロールを解除します")
+async def schedule_clear_voice_role(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    bot.db.set_voice_notify_role(interaction.guild.id, None)
+    await interaction.response.send_message("VC入室通知ロールを解除しました。", ephemeral=True)
 
 
 @schedule_group.command(name="setup", description="自分専用の日程表チャンネルを作成します")
@@ -188,6 +332,69 @@ def _is_manager(interaction: discord.Interaction) -> bool:
 def _channel_slug(member: discord.Member) -> str:
     slug = re.sub(r"[^0-9A-Za-zぁ-んァ-ン一-龥_-]+", "-", member.display_name).strip("-")
     return (slug or str(member.id))[:70].lower()
+
+
+class DeleteScheduleView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=90)
+
+    @discord.ui.button(label="削除する", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.guild is None or not _is_manager(interaction):
+            await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        deleted, failed = await _delete_active_schedule(interaction.guild)
+        result = f"予定表と個人チャンネルを削除しました。削除数：{deleted}件"
+        if failed:
+            result += f"、権限不足などで削除できなかったチャンネル：{failed}件"
+        await interaction.edit_original_response(content=result, view=None)
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="削除をキャンセルしました。", view=None)
+        self.stop()
+
+
+async def _delete_candidate_messages(guild: discord.Guild, schedule_id: int) -> None:
+    for post in bot.db.candidate_posts(schedule_id):
+        channel = guild.get_channel(post["channel_id"])
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            message = await channel.fetch_message(post["message_id"])
+            await message.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            logger.warning("Could not delete candidate post %s", post["message_id"])
+
+
+async def _delete_active_schedule(guild: discord.Guild) -> tuple[int, int]:
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        return 0, 0
+
+    await _delete_candidate_messages(guild, schedule["id"])
+    deleted = 0
+    failed = 0
+    for profile in bot.db.private_profiles(guild.id):
+        channel = guild.get_channel(profile["channel_id"]) if profile["channel_id"] else None
+        if channel is None and profile["channel_id"]:
+            try:
+                channel = await bot.fetch_channel(profile["channel_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                channel = None
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        try:
+            await channel.delete(reason="日程表の一括削除")
+            deleted += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    bot.db.delete_schedule(schedule["id"])
+    bot.db.clear_private_profiles(guild.id)
+    return deleted, failed
 
 
 async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, schedule_id: int) -> discord.TextChannel:

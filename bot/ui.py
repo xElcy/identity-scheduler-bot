@@ -100,6 +100,111 @@ def build_result_embed(db: Database, schedule_id: int) -> discord.Embed:
     return embed
 
 
+def candidate_cells(db: Database, schedule_id: int, limit: int = 10) -> list[tuple[dict, dict]]:
+    """Return the best schedule cells, ordered for the manager decision panel."""
+    ranked = [(cell, db.schedule_answer_counts(schedule_id, cell["id"])) for cell in db.schedule_cells(schedule_id)]
+    ranked.sort(key=lambda item: (item[1]["available"], item[1]["maybe"], -item[0]["cell_order"]), reverse=True)
+    return ranked[:limit]
+
+
+def build_candidate_embed(db: Database, schedule_id: int) -> discord.Embed:
+    schedule = db.get_schedule(schedule_id)
+    if schedule is None:
+        return discord.Embed(title="予定表が見つかりません", color=discord.Color.red())
+
+    ranked = candidate_cells(db, schedule_id)
+    embed = discord.Embed(
+        title=f"🏆 決定候補｜{schedule['title']}",
+        description=(
+            "回答状況から、参加可能者が多い順に候補を表示しています。\n"
+            "確定したい候補のボタンを押してください。"
+        ),
+        color=discord.Color.gold(),
+    )
+    if not ranked:
+        embed.description = "候補日時がありません。日程を編集してください。"
+        return embed
+
+    lines = []
+    for index, (cell, counts) in enumerate(ranked, start=1):
+        lines.append(
+            f"**{index}. {cell['date_label']}｜{cell['block_label']}**\n"
+            f"✅ {counts['available']}人　△ {counts['maybe']}人　❌ {counts['unavailable']}人"
+        )
+    embed.add_field(name="候補一覧", value="\n\n".join(lines), inline=False)
+    embed.set_footer(text="候補は上位10件まで表示 | 個人の回答内容は管理者だけが確認できます")
+    return embed
+
+
+def build_announcement_embed(db: Database, schedule_id: int, cell_id: int, guild: discord.Guild) -> discord.Embed:
+    schedule = db.get_schedule(schedule_id)
+    cell = next((item for item in db.schedule_cells(schedule_id) if item["id"] == cell_id), None)
+    if schedule is None or cell is None:
+        return discord.Embed(title="確定日程", description="日程情報を取得できませんでした。", color=discord.Color.red())
+
+    available = db.schedule_answer_users(schedule_id, cell_id, "available")
+    maybe = db.schedule_answer_users(schedule_id, cell_id, "maybe")
+    available_names = [guild.get_member(user_id).display_name for user_id in available if guild.get_member(user_id)]
+    maybe_names = [guild.get_member(user_id).display_name for user_id in maybe if guild.get_member(user_id)]
+    embed = discord.Embed(
+        title=f"📢 日程確定｜{schedule['title']}",
+        description=f"**{cell['date_label']}　{cell['block_label']}**\nこの日時で決定しました！",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name=f"参加予定（{len(available)}人）", value="、".join(available_names) or "回答者なし", inline=False)
+    if maybe_names:
+        embed.add_field(name=f"未定（{len(maybe)}人）", value="、".join(maybe_names), inline=False)
+    embed.set_footer(text="日程調整BOT")
+    return embed
+
+
+class CandidateView(discord.ui.View):
+    def __init__(self, db: Database, schedule_id: int) -> None:
+        super().__init__(timeout=None)
+        self.db = db
+        self.schedule_id = schedule_id
+        for index, (cell, _counts) in enumerate(candidate_cells(db, schedule_id)):
+            button = discord.ui.Button(
+                label=f"#{index + 1} {cell['date_label']} {cell['block_label']}"[:80],
+                style=discord.ButtonStyle.success,
+                row=index // 5,
+                custom_id=f"schedule:{schedule_id}:candidate:{cell['id']}",
+            )
+            button.callback = self._make_candidate_callback(cell["id"])
+            self.add_item(button)
+
+    def _make_candidate_callback(self, cell_id: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+                return
+            if not interaction.user.guild_permissions.manage_guild:
+                await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+                return
+
+            channel_id = self.db.announcement_channel_id(interaction.guild.id)
+            if channel_id is None:
+                await interaction.response.send_message(
+                    "先に `/schedule set-announcement` を日程告知用チャンネルで実行してください。",
+                    ephemeral=True,
+                )
+                return
+            channel = interaction.guild.get_channel(channel_id)
+            if not isinstance(channel, discord.TextChannel):
+                await interaction.response.send_message("設定された日程告知チャンネルが見つかりません。", ephemeral=True)
+                return
+
+            await channel.send(
+                embed=build_announcement_embed(self.db, self.schedule_id, cell_id, interaction.guild),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await interaction.response.send_message(
+                f"{channel.mention} に確定日程を告知しました。", ephemeral=True
+            )
+
+        return callback
+
+
 class ScheduleView(discord.ui.View):
     def __init__(self, db: Database, schedule_id: int, user_id: int, page: int = 0) -> None:
         super().__init__(timeout=None)
