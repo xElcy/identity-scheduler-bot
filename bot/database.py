@@ -113,7 +113,8 @@ class Database:
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id INTEGER PRIMARY KEY,
                     announcement_channel_id INTEGER,
-                    voice_notify_role_id INTEGER
+                    voice_notify_role_id INTEGER,
+                    voice_notify_channel_id INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS candidate_posts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +126,11 @@ class Database:
                 );
                 """
             )
+            try:
+                connection.execute("ALTER TABLE guild_settings ADD COLUMN voice_notify_channel_id INTEGER")
+            except sqlite3.OperationalError as error:
+                if "duplicate column name" not in str(error).lower():
+                    raise
 
     def create_event(self, guild_id: int, channel_id: int, organizer_id: int, title: str, start_at: float, remind_minutes: int) -> int:
         with self._connect() as connection:
@@ -486,6 +492,24 @@ class Database:
                 "SELECT voice_notify_role_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
             ).fetchone()
             return int(row["voice_notify_role_id"]) if row and row["voice_notify_role_id"] else None
+
+    def set_voice_notify_channel(self, guild_id: int, channel_id: int | None) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO guild_settings (guild_id, voice_notify_channel_id)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET voice_notify_channel_id = excluded.voice_notify_channel_id
+                """,
+                (guild_id, channel_id),
+            )
+
+    def voice_notify_channel_id(self, guild_id: int) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT voice_notify_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+            return int(row["voice_notify_channel_id"]) if row and row["voice_notify_channel_id"] else None
 
     def create_candidate_post(self, schedule_id: int, channel_id: int, message_id: int) -> None:
         with self._connect() as connection:

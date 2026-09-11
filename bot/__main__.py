@@ -78,7 +78,9 @@ class ScheduleBot(commands.Bot):
             return
 
         role_id = self.db.voice_notify_role_id(member.guild.id)
-        channel_id = self.db.announcement_channel_id(member.guild.id)
+        channel_id = self.db.voice_notify_channel_id(member.guild.id)
+        if channel_id is None:
+            channel_id = self.db.announcement_channel_id(member.guild.id)
         if role_id is None or channel_id is None:
             return
         role = member.guild.get_role(role_id)
@@ -216,6 +218,32 @@ async def schedule_set_announcement(interaction: discord.Interaction) -> None:
     )
 
 
+@schedule_group.command(name="set-voice-channel", description="このチャンネルをVC入室通知の送り先にします")
+async def schedule_set_voice_channel(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("通常のテキストチャンネルで実行してください。", ephemeral=True)
+        return
+    bot.db.set_voice_notify_channel(interaction.guild.id, interaction.channel.id)
+    await interaction.response.send_message(
+        f"VC入室通知の送り先を {interaction.channel.mention} に設定しました。", ephemeral=True
+    )
+
+
+@schedule_group.command(name="clear-voice-channel", description="VC入室通知の送り先を解除します")
+async def schedule_clear_voice_channel(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    bot.db.set_voice_notify_channel(interaction.guild.id, None)
+    await interaction.response.send_message(
+        "VC入室通知の個別送り先を解除しました。未設定の場合は日程告知チャンネルへ送られます。",
+        ephemeral=True,
+    )
+
+
 @schedule_group.command(name="candidates", description="回答から決定候補を管理者チャンネルに表示します")
 async def schedule_candidates(interaction: discord.Interaction) -> None:
     guild = interaction.guild
@@ -251,7 +279,7 @@ async def schedule_set_voice_role(interaction: discord.Interaction, role: discor
     bot.db.set_voice_notify_role(interaction.guild.id, role.id)
     await interaction.response.send_message(
         f"VC入室通知の対象を {role.mention} に設定しました。\n"
-        "確定日程の告知先チャンネルで、そのロールが見られる権限も確認してください。",
+        "VC通知チャンネルで、そのロールが見られる権限も確認してください。",
         ephemeral=True,
     )
 
