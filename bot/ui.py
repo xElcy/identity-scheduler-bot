@@ -117,7 +117,7 @@ def build_candidate_embed(db: Database, schedule_id: int) -> discord.Embed:
         title=f"🏆 決定候補｜{schedule['title']}",
         description=(
             "回答状況から、参加可能者が多い順に候補を表示しています。\n"
-            "確定したい候補のボタンを押してください。"
+            "人気順は参考情報です。最終決定は管理者が `/schedule decide` で行えます。"
         ),
         color=discord.Color.gold(),
     )

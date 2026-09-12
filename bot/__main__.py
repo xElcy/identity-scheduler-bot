@@ -15,6 +15,7 @@ from .ui import (
     CandidateView,
     ScheduleView,
     build_admin_monitor_embed,
+    build_announcement_embed,
     build_candidate_embed,
     build_personal_embed,
     build_result_embed,
@@ -301,6 +302,73 @@ async def schedule_candidates(interaction: discord.Interaction) -> None:
     )
     bot.db.create_candidate_post(schedule["id"], interaction.channel.id, message.id)
     await interaction.followup.send("このチャンネルに決定候補を表示しました。", ephemeral=True)
+
+
+@schedule_group.command(name="decide", description="管理者が指定した日付・時間帯を最終決定して告知します")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(
+    date="決定する日付。例：9/21 または 2026-09-21",
+    block="決定する時間帯。作成時に入力した表記をそのまま指定",
+)
+async def schedule_decide(interaction: discord.Interaction, date: str, block: str) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
+        return
+    channel_id = bot.db.announcement_channel_id(guild.id)
+    channel = guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "先に日程確定部屋で `/schedule set-announcement` を実行してください。",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        parsed_date = parse_schedule_dates(date, TIMEZONE)
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    date_key = parsed_date[0][0]
+    normalized_block = block.strip().casefold()
+    cells = bot.db.schedule_cells(schedule["id"])
+    cell = next(
+        (
+            item
+            for item in cells
+            if item["date_key"] == date_key
+            and (
+                item["block_label"].strip().casefold() == normalized_block
+                or item["block_key"].strip().casefold() == normalized_block
+            )
+        ),
+        None,
+    )
+    if cell is None:
+        available_blocks = sorted({item["block_label"] for item in cells if item["date_key"] == date_key})
+        block_hint = ", ".join(available_blocks) if available_blocks else "その日付は候補にありません"
+        await interaction.response.send_message(
+            f"指定された日付・時間帯が見つかりません。利用可能な時間帯：{block_hint}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await channel.send(
+        embed=build_announcement_embed(bot.db, schedule["id"], cell["id"], guild),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    bot.db.close_schedule(schedule["id"])
+    await _refresh_all_panels(guild, schedule["id"])
+    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
+    await interaction.followup.send(
+        f"{cell['date_label']}・{cell['block_label']} で最終決定し、日程確定部屋へ告知しました。",
+        ephemeral=True,
+    )
 
 
 @schedule_group.command(name="monitor", description="このチャンネルにリアルタイム集計パネルを設置します")
