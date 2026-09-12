@@ -82,6 +82,12 @@ class ScheduleBot(commands.Bot):
         if before.channel is not None and before.channel.id == after.channel.id:
             return
 
+        # Notify only when this member is the first human in a new voice session.
+        # Voice channel member lists include bots, so ignore bot accounts here.
+        human_members = [voice_member for voice_member in after.channel.members if not voice_member.bot]
+        if len(human_members) != 1 or human_members[0].id != member.id:
+            return
+
         role_id = self.db.voice_notify_role_id(member.guild.id)
         channel_id = self.db.voice_notify_channel_id(member.guild.id)
         if channel_id is None:
@@ -121,6 +127,7 @@ def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
 
 
 @schedule_group.command(name="create", description="新しい個人用日程表を作成します")
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     title="例：9月クラン戦の都合確認",
     dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
@@ -181,6 +188,7 @@ async def schedule_create(
 
 
 @schedule_group.command(name="edit", description="受付中の日程表を編集します")
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     title="例：9月クラン戦の都合確認",
     dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
@@ -213,6 +221,7 @@ async def schedule_edit(interaction: discord.Interaction, title: str, dates: str
 
 
 @schedule_group.command(name="delete", description="受付中の日程表と個人チャンネルを削除します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_delete(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -228,6 +237,7 @@ async def schedule_delete(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="set-announcement", description="このチャンネルを確定日程の告知先にします")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_set_announcement(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -242,6 +252,7 @@ async def schedule_set_announcement(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="set-voice-channel", description="このチャンネルをVC入室通知の送り先にします")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_set_voice_channel(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -256,6 +267,7 @@ async def schedule_set_voice_channel(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="clear-voice-channel", description="VC入室通知の送り先を解除します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_clear_voice_channel(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -268,6 +280,7 @@ async def schedule_clear_voice_channel(interaction: discord.Interaction) -> None
 
 
 @schedule_group.command(name="candidates", description="回答から決定候補を管理者チャンネルに表示します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_candidates(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None or not _is_manager(interaction):
@@ -291,6 +304,7 @@ async def schedule_candidates(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="monitor", description="このチャンネルにリアルタイム集計パネルを設置します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_monitor(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None or not _is_manager(interaction):
@@ -328,6 +342,7 @@ async def schedule_monitor(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="set-voice-role", description="VC入室通知を受け取るロールを設定します")
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(role="VC入室通知を受け取るロール")
 async def schedule_set_voice_role(interaction: discord.Interaction, role: discord.Role) -> None:
     if interaction.guild is None or not _is_manager(interaction):
@@ -345,6 +360,7 @@ async def schedule_set_voice_role(interaction: discord.Interaction, role: discor
 
 
 @schedule_group.command(name="clear-voice-role", description="VC入室通知ロールを解除します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_clear_voice_role(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -354,6 +370,7 @@ async def schedule_clear_voice_role(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="setup", description="自分専用の日程表チャンネルを作成します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_setup(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None:
@@ -374,6 +391,7 @@ async def schedule_setup(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="result", description="全員分の回答結果を確認します")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_result(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None or not _is_manager(interaction):
@@ -387,6 +405,7 @@ async def schedule_result(interaction: discord.Interaction) -> None:
 
 
 @schedule_group.command(name="close", description="全員の日程回答を締め切ります")
+@app_commands.default_permissions(manage_guild=True)
 async def schedule_close(interaction: discord.Interaction) -> None:
     guild = interaction.guild
     if guild is None or not _is_manager(interaction):
@@ -405,7 +424,11 @@ async def schedule_close(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="help", description="BOTの使い方を表示します")
+@app_commands.default_permissions(manage_guild=True)
 async def help_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
     embed = discord.Embed(title="🔒 クラン個人日程表BOT", color=discord.Color.blurple())
     embed.description = (
         "メンバーごとに鍵チャンネルを作り、他のメンバーには回答内容を見せずに日程を集計します。\n\n"
