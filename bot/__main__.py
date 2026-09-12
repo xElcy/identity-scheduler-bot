@@ -82,6 +82,8 @@ class ScheduleBot(commands.Bot):
             return
         if before.channel is not None and before.channel.id == after.channel.id:
             return
+        if self.db.is_voice_channel_ignored(member.guild.id, after.channel.id):
+            return
 
         # Notify only when this member is the first human in a new voice session.
         # Voice channel member lists include bots, so ignore bot accounts here.
@@ -278,6 +280,41 @@ async def schedule_clear_voice_channel(interaction: discord.Interaction) -> None
         "VC入室通知の個別送り先を解除しました。未設定の場合は日程告知チャンネルへ送られます。",
         ephemeral=True,
     )
+
+
+@schedule_group.command(name="ignore-voice-channel", description="指定したVCでは入室通知を送らないようにします")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(channel="入室通知を鳴らさないVC")
+async def schedule_ignore_voice_channel(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    bot.db.ignore_voice_channel(interaction.guild.id, channel.id)
+    await interaction.response.send_message(
+        f"{channel.mention} をVC入室通知の対象外にしました。",
+        ephemeral=True,
+    )
+
+
+@schedule_group.command(name="unignore-voice-channel", description="指定したVCの入室通知を再び有効にします")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(channel="入室通知を再び有効にするVC")
+async def schedule_unignore_voice_channel(
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
+        return
+    removed = bot.db.unignore_voice_channel(interaction.guild.id, channel.id)
+    if removed:
+        message = f"{channel.mention} のVC入室通知を再び有効にしました。"
+    else:
+        message = f"{channel.mention} は通知対象外に登録されていません。"
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @schedule_group.command(name="candidates", description="回答から決定候補を管理者チャンネルに表示します")

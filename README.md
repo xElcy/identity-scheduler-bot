@@ -83,3 +83,17 @@ GitHub Actionsは実行時間制限があるため、BOT本体を常時稼働さ
 - Discordトークンは`.env`やホスティングの環境変数で管理
 
 ※ Discordの仕様上、サーバーのAdministrator権限を持つ人はチャンネル権限を bypass できます。完全に見えなくするには、管理者権限の運用も分けてください。
+
+## VC通知を鳴らさないチャンネル
+
+管理者用の会議室など、入室通知を鳴らしたくないVCは管理者が次のコマンドで登録できます。複数のVCを登録でき、チャンネル名を変更しても設定は維持されます。
+
+```text
+/schedule ignore-voice-channel channel:会議室
+```
+
+再び通知対象へ戻す場合は次を実行します。
+
+```text
+/schedule unignore-voice-channel channel:会議室
+```

@@ -120,6 +120,11 @@ class Database:
                     voice_notify_role_id INTEGER,
                     voice_notify_channel_id INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS voice_notify_ignored_channels (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id)
+                );
                 CREATE TABLE IF NOT EXISTS candidate_posts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     schedule_id INTEGER NOT NULL,
@@ -567,6 +572,29 @@ class Database:
                 "SELECT voice_notify_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)
             ).fetchone()
             return int(row["voice_notify_channel_id"]) if row and row["voice_notify_channel_id"] else None
+
+    def ignore_voice_channel(self, guild_id: int, channel_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO voice_notify_ignored_channels (guild_id, channel_id) VALUES (?, ?)",
+                (guild_id, channel_id),
+            )
+
+    def unignore_voice_channel(self, guild_id: int, channel_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM voice_notify_ignored_channels WHERE guild_id = ? AND channel_id = ?",
+                (guild_id, channel_id),
+            )
+            return cursor.rowcount > 0
+
+    def is_voice_channel_ignored(self, guild_id: int, channel_id: int) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM voice_notify_ignored_channels WHERE guild_id = ? AND channel_id = ?",
+                (guild_id, channel_id),
+            ).fetchone()
+            return row is not None
 
     def create_candidate_post(self, schedule_id: int, channel_id: int, message_id: int) -> None:
         with self._connect() as connection:
