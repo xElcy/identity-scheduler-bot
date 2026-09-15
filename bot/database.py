@@ -1,4 +1,8 @@
+import json
 import sqlite3
+from datetime import date, datetime, timedelta
+from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -8,11 +12,16 @@ class Database:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.path)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def setup(self) -> None:
         with self._connect() as connection:
@@ -133,6 +142,14 @@ class Database:
                     created_at REAL NOT NULL DEFAULT (unixepoch()),
                     FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS schedule_decisions (
+                    schedule_id INTEGER NOT NULL,
+                    cell_id INTEGER NOT NULL,
+                    message_id INTEGER,
+                    PRIMARY KEY (schedule_id, cell_id),
+                    FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE,
+                    FOREIGN KEY (cell_id) REFERENCES schedule_cells(id) ON DELETE CASCADE
+                );
                 """
             )
             try:
@@ -145,12 +162,21 @@ class Database:
                 ("category_id", "INTEGER"),
                 ("admin_panel_channel_id", "INTEGER"),
                 ("admin_panel_message_id", "INTEGER"),
+                ("rolling_days", "INTEGER NOT NULL DEFAULT 0"),
+                ("rolling_timezone", "TEXT NOT NULL DEFAULT 'Asia/Tokyo'"),
+                ("rolling_blocks", "TEXT"),
+                ("window_start", "TEXT"),
+                ("window_end", "TEXT"),
+                ("panel_revision", "INTEGER NOT NULL DEFAULT 0"),
+                ("panels_synced_revision", "INTEGER NOT NULL DEFAULT -1"),
             ):
                 try:
                     connection.execute(f"ALTER TABLE schedules ADD COLUMN {column} {definition}")
                 except sqlite3.OperationalError as error:
                     if "duplicate column name" not in str(error).lower():
                         raise
+            if "visible" not in {row[1] for row in connection.execute("PRAGMA table_info(schedule_cells)")}:
+                connection.execute("ALTER TABLE schedule_cells ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
 
     def create_event(self, guild_id: int, channel_id: int, organizer_id: int, title: str, start_at: float, remind_minutes: int) -> int:
         with self._connect() as connection:
@@ -373,12 +399,96 @@ class Database:
             ).fetchone()
             return dict(row) if row else None
 
-    def schedule_cells(self, schedule_id: int) -> list[dict[str, Any]]:
+    def latest_schedule(self, guild_id: int) -> dict[str, Any] | None:
         with self._connect() as connection:
+            row = connection.execute("SELECT * FROM schedules WHERE guild_id = ? ORDER BY id DESC LIMIT 1", (guild_id,)).fetchone()
+            return dict(row) if row else None
+
+    def schedule_cells(self, schedule_id: int, *, include_history: bool = False) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            schedule = self.get_schedule(schedule_id)
+            filters = ""
+            params: list[Any] = [schedule_id]
+            if not include_history:
+                filters = " AND visible = 1"
+                if schedule and schedule["rolling_days"]:
+                    today = datetime.now(ZoneInfo(schedule["rolling_timezone"])).date()
+                    filters += " AND date_key BETWEEN ? AND ?"
+                    params += [today.isoformat(), (today + timedelta(days=schedule["rolling_days"] - 1)).isoformat()]
             rows = connection.execute(
-                "SELECT * FROM schedule_cells WHERE schedule_id = ? ORDER BY cell_order", (schedule_id,)
+                "SELECT * FROM schedule_cells WHERE schedule_id = ?" + filters + " ORDER BY date_key, cell_order, id", params
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def enable_rolling(self, schedule_id: int, timezone: str = "Asia/Tokyo", *, reopen: bool = False) -> None:
+        ZoneInfo(timezone)
+        cells = self.schedule_cells(schedule_id, include_history=True)
+        blocks = list(dict.fromkeys((c["block_key"], c["block_label"]) for c in cells if c["visible"]))
+        if not 1 <= len(blocks) <= 4:
+            raise ValueError("時間帯は1〜4種類で設定してください。")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE schedules SET rolling_days = 7, rolling_timezone = ?, rolling_blocks = ?, "
+                "is_open = CASE WHEN ? THEN 1 ELSE is_open END, panel_revision = panel_revision + 1 WHERE id = ?",
+                (timezone, json.dumps(blocks, ensure_ascii=False), reopen, schedule_id),
+            )
+        self.advance_rolling(schedule_id)
+
+    def advance_rolling(self, schedule_id: int, today: date | None = None) -> bool:
+        schedule = self.get_schedule(schedule_id)
+        if not schedule or not schedule["rolling_days"] or not schedule["is_open"]:
+            return False
+        today = today or datetime.now(ZoneInfo(schedule["rolling_timezone"])).date()
+        start = today.isoformat()
+        end = (today + timedelta(days=schedule["rolling_days"] - 1)).isoformat()
+        if schedule["window_start"] == start and schedule["window_end"] == end:
+            return False
+        blocks = json.loads(schedule["rolling_blocks"])
+        # Keep existing IDs: buttons and all historical answers reference them.
+        with self._connect() as connection:
+            for offset in range(schedule["rolling_days"]):
+                day = today + timedelta(days=offset)
+                label = day.strftime("%m/%d") + f"（{'月火水木金土日'[day.weekday()]}）"
+                for index, (key, block_label) in enumerate(blocks):
+                    row = connection.execute(
+                        "SELECT id FROM schedule_cells WHERE schedule_id = ? AND date_key = ? AND block_label = ? ORDER BY id LIMIT 1",
+                        (schedule_id, day.isoformat(), block_label),
+                    ).fetchone()
+                    if row:
+                        connection.execute("UPDATE schedule_cells SET visible = 1 WHERE id = ?", (row["id"],))
+                    else:
+                        connection.execute(
+                            "INSERT INTO schedule_cells (schedule_id, date_key, date_label, block_key, block_label, cell_order) VALUES (?, ?, ?, ?, ?, ?)",
+                            (schedule_id, day.isoformat(), label, key, block_label, offset * len(blocks) + index),
+                        )
+            connection.execute(
+                "UPDATE schedules SET window_start = ?, window_end = ?, panel_revision = panel_revision + 1 WHERE id = ?",
+                (start, end, schedule_id),
+            )
+        return True
+
+    def mark_panels_synced(self, schedule_id: int, revision: int) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE schedules SET panels_synced_revision = ? WHERE id = ?", (revision, schedule_id))
+
+    def reserve_decision(self, schedule_id: int, cell_id: int) -> bool:
+        with self._connect() as connection:
+            return connection.execute(
+                "INSERT OR IGNORE INTO schedule_decisions (schedule_id, cell_id) VALUES (?, ?)",
+                (schedule_id, cell_id),
+            ).rowcount == 1
+
+    def record_decision(self, schedule_id: int, cell_id: int, message_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("UPDATE schedule_decisions SET message_id = ? WHERE schedule_id = ? AND cell_id = ?", (message_id, schedule_id, cell_id))
+
+    def release_decision(self, schedule_id: int, cell_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM schedule_decisions WHERE schedule_id = ? AND cell_id = ? AND message_id IS NULL", (schedule_id, cell_id))
+
+    def decided_cell_ids(self, schedule_id: int) -> set[int]:
+        with self._connect() as connection:
+            return {row[0] for row in connection.execute("SELECT cell_id FROM schedule_decisions WHERE schedule_id = ?", (schedule_id,))}
 
     def schedule_answer(self, schedule_id: int, cell_id: int, user_id: int) -> str:
         with self._connect() as connection:
@@ -428,14 +538,17 @@ class Database:
             return [int(row["user_id"]) for row in rows]
 
     def schedule_answered_users(self, schedule_id: int) -> list[int]:
+        ids = [cell["id"] for cell in self.schedule_cells(schedule_id)]
+        if not ids:
+            return []
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT DISTINCT user_id FROM schedule_answers
-                WHERE schedule_id = ? AND status != 'blank'
+                WHERE schedule_id = ? AND status != 'blank' AND cell_id IN ({','.join('?' for _ in ids)})
                 ORDER BY user_id
                 """,
-                (schedule_id,),
+                [schedule_id, *ids],
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
 
@@ -492,28 +605,22 @@ class Database:
             connection.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
 
     def edit_schedule(self, schedule_id: int, title: str, cells: list[dict[str, Any]]) -> None:
-        """Replace the active schedule's cells and reset answers.
-
-        Keeping the schedule id means existing private channels can be reused.
-        Answers are intentionally reset because edited cells may represent
-        different dates or time blocks.
-        """
+        """Reconcile by date and exact block label, retaining every answer."""
         with self._connect() as connection:
-            connection.execute("UPDATE schedules SET title = ?, is_open = 1 WHERE id = ?", (title, schedule_id))
-            connection.execute("DELETE FROM schedule_answers WHERE schedule_id = ?", (schedule_id,))
-            connection.execute("DELETE FROM candidate_posts WHERE schedule_id = ?", (schedule_id,))
-            connection.execute("DELETE FROM schedule_cells WHERE schedule_id = ?", (schedule_id,))
-            connection.executemany(
-                """
-                INSERT INTO schedule_cells
-                (schedule_id, date_key, date_label, block_key, block_label, cell_order)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (schedule_id, cell["date_key"], cell["date_label"], cell["block_key"], cell["block_label"], index)
-                    for index, cell in enumerate(cells)
-                ],
-            )
+            connection.execute("UPDATE schedules SET title = ?, is_open = 1, panel_revision = panel_revision + 1 WHERE id = ?", (title, schedule_id))
+            connection.execute("UPDATE schedule_cells SET visible = 0 WHERE schedule_id = ?", (schedule_id,))
+            for index, cell in enumerate(cells):
+                row = connection.execute(
+                    "SELECT id FROM schedule_cells WHERE schedule_id = ? AND date_key = ? AND block_label = ? ORDER BY id LIMIT 1",
+                    (schedule_id, cell["date_key"], cell["block_label"]),
+                ).fetchone()
+                if row:
+                    connection.execute("UPDATE schedule_cells SET visible = 1, cell_order = ?, block_key = ? WHERE id = ?", (index, cell["block_key"], row["id"]))
+                else:
+                    connection.execute(
+                        "INSERT INTO schedule_cells (schedule_id, date_key, date_label, block_key, block_label, cell_order) VALUES (?, ?, ?, ?, ?, ?)",
+                        (schedule_id, cell["date_key"], cell["date_label"], cell["block_key"], cell["block_label"], index),
+                    )
 
     def clear_private_profiles(self, guild_id: int) -> None:
         with self._connect() as connection:

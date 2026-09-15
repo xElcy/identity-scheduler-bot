@@ -2,11 +2,13 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from .database import Database
@@ -14,6 +16,7 @@ from .ui import (
     AdminMonitorView,
     CandidateView,
     ScheduleView,
+    announce_decision,
     build_admin_monitor_embed,
     build_announcement_embed,
     build_candidate_embed,
@@ -42,9 +45,12 @@ class ScheduleBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
         self.db = Database(Path("data") / "schedule.db")
         self.views_registered = False
+        self.synced_panels: set[tuple[int, int]] = set()
+        self.panel_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
     async def setup_hook(self) -> None:
         self.db.setup()
+        self.rolling_refresh.start()
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -71,6 +77,37 @@ class ScheduleBot(commands.Bot):
             if schedule["admin_panel_message_id"]:
                 self.add_view(AdminMonitorView(self.db, schedule["id"]), message_id=schedule["admin_panel_message_id"])
         logger.info("Logged in as %s", self.user)
+
+    @tasks.loop(seconds=30)
+    async def rolling_refresh(self) -> None:
+        for guild in self.guilds:
+            try:
+                schedule = self.db.active_schedule(guild.id)
+                if not schedule or not schedule["rolling_days"]:
+                    continue
+                self.db.advance_rolling(schedule["id"])
+                schedule = self.db.get_schedule(schedule["id"])
+                revision = schedule["panel_revision"]
+                key = (schedule["id"], revision)
+                if key in self.synced_panels and revision == schedule["panels_synced_revision"]:
+                    continue
+                personal_ok = await _refresh_all_panels(guild, schedule["id"])
+                management_ok = await refresh_admin_panel(self, self.db, schedule["id"], guild)
+                if personal_ok and management_ok:
+                    self.db.mark_panels_synced(schedule["id"], revision)
+                    self.synced_panels = {entry for entry in self.synced_panels if entry[0] != schedule["id"]}
+                    self.synced_panels.add(key)
+                    logger.info("Rolling panels synced: schedule=%s window=%s..%s", schedule["id"], schedule["window_start"], schedule["window_end"])
+            except Exception:
+                logger.exception("Rolling schedule refresh failed for guild %s; will retry", guild.id)
+
+    @rolling_refresh.before_loop
+    async def before_rolling_refresh(self) -> None:
+        await self.wait_until_ready()
+
+    async def close(self) -> None:
+        self.rolling_refresh.cancel()
+        await super().close()
 
     async def on_voice_state_update(
         self,
@@ -109,7 +146,17 @@ class ScheduleBot(commands.Bot):
 
 
 bot = ScheduleBot()
-schedule_group = app_commands.Group(name="schedule", description="個人専用チャンネルで日程を調整します")
+
+
+class AdminScheduleGroup(app_commands.Group):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is not None and _is_manager(interaction):
+            return True
+        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
+        return False
+
+
+schedule_group = AdminScheduleGroup(name="schedule", description="個人専用チャンネルで日程を調整します", default_permissions=discord.Permissions(administrator=True), guild_only=True)
 
 
 def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
@@ -129,11 +176,16 @@ def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
     ]
 
 
+def _week_cells(blocks: str) -> list[dict]:
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    return _build_schedule_cells(",".join((today + timedelta(days=i)).isoformat() for i in range(7)), blocks)
+
+
 @schedule_group.command(name="create", description="新しい個人用日程表を作成します")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     title="例：9月クラン戦の都合確認",
-    dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
+    dates="省略すると今日から7日間を毎日自動更新。固定日程の場合だけ指定",
     blocks="時間帯をカンマ区切り。例：昼 12-18時, 夜 18-24時",
     target_role="このロールを持つメンバーだけ個人鍵チャンネルを作成",
     category="個人鍵チャンネルを入れるカテゴリー。省略時は.env設定を使用",
@@ -141,9 +193,9 @@ def _build_schedule_cells(dates: str, blocks: str) -> list[dict]:
 async def schedule_create(
     interaction: discord.Interaction,
     title: str,
-    dates: str,
     blocks: str,
     target_role: discord.Role,
+    dates: str | None = None,
     category: discord.CategoryChannel | None = None,
 ) -> None:
     guild = interaction.guild
@@ -154,8 +206,14 @@ async def schedule_create(
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
         return
 
+    if bot.db.active_schedule(guild.id):
+        await interaction.response.send_message("受付中の予定表があります。1人追加は `/schedule add-member`、変更は `/schedule edit` を使ってください。", ephemeral=True)
+        return
+    if target_role.is_default():
+        await interaction.response.send_message("メンバー専用の対象ロールを指定してください。", ephemeral=True)
+        return
     try:
-        cells = _build_schedule_cells(dates, blocks)
+        cells = _build_schedule_cells(dates, blocks) if dates else _week_cells(blocks)
     except ValueError as error:
         await interaction.response.send_message(str(error), ephemeral=True)
         return
@@ -171,6 +229,8 @@ async def schedule_create(
         target_role_id=target_role.id,
         category_id=category_id,
     )
+    if dates is None:
+        bot.db.enable_rolling(schedule_id, TIMEZONE)
 
     members = [member for member in guild.members if not member.bot and target_role in member.roles]
 
@@ -197,7 +257,7 @@ async def schedule_create(
     dates="日付をカンマ区切り。例：9/20, 9/21, 9/22",
     blocks="時間帯をカンマ区切り。例：昼 12-18時, 夜 18-24時",
 )
-async def schedule_edit(interaction: discord.Interaction, title: str, dates: str, blocks: str) -> None:
+async def schedule_edit(interaction: discord.Interaction, title: str | None = None, dates: str | None = None, blocks: str | None = None) -> None:
     guild = interaction.guild
     if guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -206,21 +266,104 @@ async def schedule_edit(interaction: discord.Interaction, title: str, dates: str
     if schedule is None:
         await interaction.response.send_message("現在受付中の日程表はありません。", ephemeral=True)
         return
+    if schedule["rolling_days"] and dates is not None:
+        await interaction.response.send_message("毎日自動更新中は日付の指定が不要です。タイトル・時間帯のみ変更できます。", ephemeral=True)
+        return
+    existing = bot.db.schedule_cells(schedule["id"])
+    blocks = blocks or ",".join(dict.fromkeys(cell["block_label"] for cell in existing))
+    dates = dates or ",".join(dict.fromkeys(cell["date_key"] for cell in existing))
     try:
-        cells = _build_schedule_cells(dates, blocks)
+        cells = _week_cells(blocks) if schedule["rolling_days"] else _build_schedule_cells(dates, blocks)
     except ValueError as error:
         await interaction.response.send_message(str(error), ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=True)
-    await _delete_candidate_messages(guild, schedule["id"])
-    bot.db.edit_schedule(schedule["id"], title, cells)
+    bot.db.edit_schedule(schedule["id"], title or schedule["title"], cells)
+    if schedule["rolling_days"]:
+        bot.db.enable_rolling(schedule["id"], TIMEZONE)
     await _refresh_all_panels(guild, schedule["id"])
     await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
     await interaction.followup.send(
-        "日程表を編集しました。安全のため、これまでの回答はリセットされています。",
+        "日程表を編集しました。同じ日付・同じ時間帯の回答は引き継ぎ、表示から外れた回答も履歴に保存しています。",
         ephemeral=True,
     )
+
+
+@schedule_group.command(name="add-member", description="指定メンバー1人だけ専用部屋と回答パネルを追加します")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(member="対象ロールが付いた追加メンバー")
+async def schedule_add_member(interaction: discord.Interaction, member: discord.Member) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id)
+    if schedule is None:
+        await interaction.response.send_message("受付中の予定表がありません。`/schedule rolling` で既存の予定表を再開できます。", ephemeral=True)
+        return
+    if member.bot or member.guild.id != guild.id:
+        await interaction.response.send_message("このサーバーのメンバーを指定してください。", ephemeral=True)
+        return
+    if not schedule["target_role_id"] or not any(role.id == schedule["target_role_id"] for role in member.roles):
+        await interaction.response.send_message("先にそのメンバーへ予定表の対象ロールを付けてください。", ephemeral=True)
+        return
+    if schedule["category_id"] and not isinstance(guild.get_channel(schedule["category_id"]), discord.CategoryChannel):
+        await interaction.response.send_message("予定表のカテゴリーが見つかりません。カテゴリー設定を確認してください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    bot.db.advance_rolling(schedule["id"])
+    try:
+        channel = await _ensure_private_panel(guild, member, schedule["id"])
+    except discord.HTTPException:
+        logger.exception("Could not add member %s", member.id)
+        await interaction.followup.send("部屋・パネルを作成できませんでした。BOTのカテゴリー権限を確認して再実行してください。", ephemeral=True)
+        return
+    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
+    await interaction.followup.send(f"{member.display_name} さんの予定表を用意しました：{channel.mention}\n既存の部屋があれば再利用します。", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@schedule_group.command(name="rolling", description="既存の回答を残して、今日から7日間の自動更新を開始・再開します")
+@app_commands.default_permissions(administrator=True)
+async def schedule_rolling(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(guild.id) or bot.db.latest_schedule(guild.id)
+    if not schedule:
+        await interaction.response.send_message("最初に `/schedule create` で予定表を作成してください。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        bot.db.enable_rolling(schedule["id"], TIMEZONE, reopen=True)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    await _refresh_all_panels(guild, schedule["id"])
+    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
+    await interaction.followup.send("今日から7日間の自動更新を開始しました。回答は保存し、日付が変わると先の1日が追加されます。", ephemeral=True)
+
+
+@schedule_group.command(name="history", description="過去の日付に保存された回答を管理者だけに表示します")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(date="履歴の日付。例：2026-09-14")
+async def schedule_history(interaction: discord.Interaction, date: str) -> None:
+    if interaction.guild is None or not _is_manager(interaction):
+        await interaction.response.send_message("管理者権限が必要です。", ephemeral=True)
+        return
+    schedule = bot.db.active_schedule(interaction.guild.id) or bot.db.latest_schedule(interaction.guild.id)
+    if not schedule:
+        await interaction.response.send_message("予定表がありません。", ephemeral=True)
+        return
+    try:
+        parsed = parse_schedule_dates(date, TIMEZONE)
+        if len(parsed) != 1:
+            raise ValueError("日付は1日だけ指定してください。")
+    except ValueError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=build_result_embed(bot.db, schedule["id"], parsed[0][0]), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @schedule_group.command(name="delete", description="受付中の日程表と個人チャンネルを削除します")
@@ -367,6 +510,8 @@ async def schedule_decide(interaction: discord.Interaction, date: str, block: st
 
     try:
         parsed_date = parse_schedule_dates(date, TIMEZONE)
+        if len(parsed_date) != 1:
+            raise ValueError("日付は1日だけ指定してください。")
     except ValueError as error:
         await interaction.response.send_message(str(error), ephemeral=True)
         return
@@ -394,18 +539,9 @@ async def schedule_decide(interaction: discord.Interaction, date: str, block: st
         )
         return
 
-    await interaction.response.defer(ephemeral=True)
-    await channel.send(
-        embed=build_announcement_embed(bot.db, schedule["id"], cell["id"], guild),
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-    bot.db.close_schedule(schedule["id"])
-    await _refresh_all_panels(guild, schedule["id"])
-    await refresh_admin_panel(bot, bot.db, schedule["id"], guild)
-    await interaction.followup.send(
-        f"{cell['date_label']}・{cell['block_label']} で最終決定し、日程確定部屋へ告知しました。",
-        ephemeral=True,
-    )
+    if await announce_decision(interaction, bot.db, schedule["id"], cell["id"]):
+        if not schedule["rolling_days"]:
+            await _refresh_all_panels(guild, schedule["id"])
 
 
 @schedule_group.command(name="monitor", description="このチャンネルにリアルタイム集計パネルを設置します")
@@ -529,7 +665,7 @@ async def schedule_close(interaction: discord.Interaction) -> None:
 
 
 @bot.tree.command(name="help", description="BOTの使い方を表示します")
-@app_commands.default_permissions(manage_guild=True)
+@app_commands.default_permissions(administrator=True)
 async def help_command(interaction: discord.Interaction) -> None:
     if interaction.guild is None or not _is_manager(interaction):
         await interaction.response.send_message("サーバー管理権限が必要です。", ephemeral=True)
@@ -539,6 +675,10 @@ async def help_command(interaction: discord.Interaction) -> None:
         "メンバーごとに鍵チャンネルを作り、他のメンバーには回答内容を見せずに日程を集計します。\n\n"
         "`/schedule create` — 管理者が日程表を作成\n"
         "`/schedule setup` — 自分の専用チャンネルを作成\n"
+        "`/schedule add-member member:@メンバー` — 1人だけ追加\n"
+        "`/schedule rolling` — 回答を残して7日間の自動更新を開始・再開\n"
+        "`/schedule history date:2026-09-14` — 過去の回答を確認\n"
+        "`/schedule decide` — @everyone 付きで日程確定を告知\n"
         "`/schedule result` — 管理者が集計結果を確認\n"
         "`/schedule close` — 回答を締め切る\n\n"
         "個人チャンネルのボタンを押すだけで、`— → ○ → △ → ×` と回答が切り替わります。"
@@ -549,12 +689,12 @@ async def help_command(interaction: discord.Interaction) -> None:
 def _is_manager(interaction: discord.Interaction) -> bool:
     member = interaction.user
     return isinstance(member, discord.Member) and (
-        member.guild_permissions.manage_guild or member.guild_permissions.administrator
+        member.guild_permissions.administrator
     )
 
 
 def _is_manager_member(member: discord.Member) -> bool:
-    return member.guild_permissions.manage_guild or member.guild_permissions.administrator
+    return member.guild_permissions.administrator
 
 
 def _channel_slug(member: discord.Member) -> str:
@@ -634,6 +774,12 @@ async def _delete_active_schedule(guild: discord.Guild) -> tuple[int, int]:
 
 
 async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, schedule_id: int) -> discord.TextChannel:
+    lock = bot.panel_locks.setdefault((guild.id, member.id), asyncio.Lock())
+    async with lock:
+        return await _ensure_private_panel_locked(guild, member, schedule_id)
+
+
+async def _ensure_private_panel_locked(guild: discord.Guild, member: discord.Member, schedule_id: int) -> discord.TextChannel:
     schedule = bot.db.get_schedule(schedule_id)
     if schedule is None:
         raise RuntimeError("Schedule is not available")
@@ -644,7 +790,7 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
         if channel is None:
             try:
                 channel = await bot.fetch_channel(profile["channel_id"])
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            except discord.NotFound:
                 channel = None
 
     if not isinstance(channel, discord.TextChannel):
@@ -678,6 +824,8 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
             overwrites=overwrites,
             topic="このチャンネルは対象本人・運営・BOTだけが見られる個人用日程表です。",
         )
+        # Persist the room before sending its panel so retries cannot duplicate it.
+        bot.db.save_private_profile(guild.id, member.id, channel.id, 0)
     else:
         category_id = schedule.get("category_id")
         if category_id is None and PRIVATE_CATEGORY_ID and PRIVATE_CATEGORY_ID.isdigit():
@@ -697,7 +845,7 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
     if profile and profile["panel_message_id"]:
         try:
             message = await channel.fetch_message(profile["panel_message_id"])
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except discord.NotFound:
             message = None
 
     embed = build_personal_embed(bot.db, schedule_id, member.id, 0)
@@ -710,9 +858,14 @@ async def _ensure_private_panel(guild: discord.Guild, member: discord.Member, sc
     return channel
 
 
-async def _refresh_all_panels(guild: discord.Guild, schedule_id: int) -> None:
+async def _refresh_all_panels(guild: discord.Guild, schedule_id: int) -> bool:
+    success = True
+    schedule = bot.db.get_schedule(schedule_id)
     for profile in bot.db.private_profiles(guild.id):
         if not profile["channel_id"] or not profile["panel_message_id"]:
+            continue
+        member = guild.get_member(profile["user_id"])
+        if member is None or member.bot or (schedule["target_role_id"] and not any(role.id == schedule["target_role_id"] for role in member.roles)):
             continue
         channel = guild.get_channel(profile["channel_id"])
         if not isinstance(channel, discord.TextChannel):
@@ -725,6 +878,8 @@ async def _refresh_all_panels(guild: discord.Guild, schedule_id: int) -> None:
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             logger.warning("Could not refresh private panel in %s", channel.id)
+            success = False
+    return success
 
 
 bot.tree.add_command(schedule_group)
